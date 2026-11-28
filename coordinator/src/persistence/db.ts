@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -12,11 +12,133 @@ const __dirname = dirname(__filename);
 // is the recommended zero-install SQLite driver.
 const nodeRequire = createRequire(import.meta.url);
 const { DatabaseSync } = nodeRequire("node:sqlite") as typeof import("node:sqlite");
-
-export type Database = InstanceType<typeof DatabaseSync> | PostgresDatabase;
-
+export type SqliteDatabase = InstanceType<typeof DatabaseSync>;
+export type Database = SqliteDatabase | PostgresDatabase;
 export function isPostgresDatabase(db: Database): db is PostgresDatabase {
   return (db as any).getPool !== undefined;
+}
+
+/**
+ * Bounds for `COORDINATOR_SQLITE_BUSY_TIMEOUT_MS`.
+ *
+ * 0 fails immediately instead of waiting. The upper bound keeps a blocked
+ * writer from looking like a hang: after at most a minute it surfaces the
+ * stable `storage_unavailable` error instead.
+ */
+export const MIN_SQLITE_BUSY_TIMEOUT_MS = 0;
+export const MAX_SQLITE_BUSY_TIMEOUT_MS = 60_000;
+export const DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5_000;
+
+/** Stable code/message returned to clients when the busy timeout expires. */
+export const STORAGE_UNAVAILABLE_CODE = "storage_unavailable";
+export const STORAGE_UNAVAILABLE_MESSAGE = "Storage is temporarily unavailable";
+
+/**
+ * Redacted storage failure. It deliberately hides the SQLite error text,
+ * database path and lock holder details from API responses and logs.
+ */
+export class StorageUnavailableError extends Error {
+  readonly code = STORAGE_UNAVAILABLE_CODE;
+  readonly statusCode = 503;
+
+  constructor() {
+    super(STORAGE_UNAVAILABLE_MESSAGE);
+    this.name = "StorageUnavailableError";
+  }
+}
+
+/**
+ * Set SQLite's bounded busy timeout in milliseconds on one connection.
+ *
+ * SQLite reports `SQLITE_BUSY` when the timeout expires; the repository maps
+ * that to `StorageUnavailableError`. Invalid values throw instead of being
+ * silently ignored, so a misconfigured deployment fails during startup.
+ */
+export function setSqliteBusyTimeout(db: SqliteDatabase, timeoutMs: number): void {
+  if (
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < MIN_SQLITE_BUSY_TIMEOUT_MS ||
+    timeoutMs > MAX_SQLITE_BUSY_TIMEOUT_MS
+  ) {
+    throw new RangeError(
+      `sqliteBusyTimeoutMs must be an integer between ${MIN_SQLITE_BUSY_TIMEOUT_MS} and ${MAX_SQLITE_BUSY_TIMEOUT_MS}`
+    );
+  }
+
+  db.exec(`PRAGMA busy_timeout = ${timeoutMs}`);
+}
+
+/**
+ * SQLite uses `errcode` 5 (`SQLITE_BUSY`) or 6 (`SQLITE_LOCKED`) when a lock
+ * cannot be acquired. Older drivers may only expose the message.
+ */
+export function isSqliteBusyError(error: unknown): boolean {
+  if (error instanceof StorageUnavailableError) return false;
+  if (typeof error !== "object" || error === null) return false;
+
+  const candidate = error as {
+    errcode?: unknown;
+    code?: unknown;
+    message?: unknown;
+  };
+  if (typeof candidate.errcode === "number") {
+    const primaryCode = candidate.errcode & 0xff;
+    if (primaryCode === 5 || primaryCode === 6) return true;
+  }
+  if (candidate.code === "SQLITE_BUSY" || candidate.code === "SQLITE_LOCKED") {
+    return true;
+  }
+  return typeof candidate.message === "string" &&
+    /SQLITE_BUSY|SQLITE_LOCKED|database (?:table )?is locked|database is busy/i.test(
+      candidate.message
+    );
+}
+
+/** Replace driver-specific lock errors with the stable redacted error. */
+export function toStorageError(error: unknown): unknown {
+  if (error instanceof StorageUnavailableError) return error;
+  return isSqliteBusyError(error) ? new StorageUnavailableError() : error;
+}
+
+/**
+ * Files SQLite may create for a database at `filename`.
+ *
+ * `-wal` and `-shm` belong to WAL mode (the coordinator's default) and
+ * `-journal` belongs to the rollback journal used while a write transaction
+ * is in flight. Both can contain the same sensitive order state as the main
+ * database file.
+ */
+export function sqliteDatabaseFileNames(filename: string): string[] {
+  return [filename, `${filename}-wal`, `${filename}-shm`, `${filename}-journal`];
+}
+
+/**
+ * Create the SQLite database file (if needed) with owner-only permissions and
+ * tighten the mode of an existing file plus any journal/WAL sidecars.
+ *
+ * This runs before the schema or any order data is written, so a newly created
+ * database is never briefly world-readable. `openSync(..., "a", 0o600)` creates
+ * a missing file without truncating an existing one; `chmodSync` then tightens
+ * an existing file (the mode passed to `open` is ignored for existing files).
+ *
+ * Permission errors are intentionally not swallowed: if owner-only access
+ * cannot be established, the coordinator must not continue writing order state
+ * to a database other local users may be able to read.
+ *
+ * Platform note: on POSIX systems the mode is enforced as Unix permissions. On
+ * Windows, Node maps the mode onto the read-only attribute and does not change
+ * the file's NTFS ACLs; see `coordinator/README.md` for the documented handling.
+ */
+export function setSqliteDatabasePermissions(filename: string): void {
+  const fd = openSync(filename, "a", 0o600);
+  closeSync(fd);
+  chmodSync(filename, 0o600);
+
+  // SQLite creates the sidecars lazily. Tighten whichever ones already exist;
+  // ones created later inherit the database file's mode from SQLite itself.
+  for (const sidecar of sqliteDatabaseFileNames(filename).slice(1)) {
+    if (existsSync(sidecar)) chmodSync(sidecar, 0o600);
+  }
 }
 
 /**
@@ -146,19 +268,47 @@ export class PostgresStatement {
  * corrupted, the coordinator can rebuild it by re-reading events from
  * both chains.
  */
-export async function openDatabase(url: string): Promise<Database> {
+export interface OpenDatabaseOptions {
+  /**
+   * SQLite lock wait per connection, in milliseconds. The coordinator config
+   * validates this at startup; `setSqliteBusyTimeout` re-checks the bounds for
+   * direct callers. Ignored for PostgreSQL URLs.
+   */
+  sqliteBusyTimeoutMs?: number;
+}
+
+export async function openDatabase(
+  url: string,
+  options: OpenDatabaseOptions = {}
+): Promise<Database> {
   if (url.startsWith("postgres://") || url.startsWith("postgresql://")) {
     return openPostgresDatabase(url);
   } else {
-    return openSqliteDatabase(url);
+    return openSqliteDatabase(
+      url,
+      options.sqliteBusyTimeoutMs ?? DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    );
   }
 }
 
-function openSqliteDatabase(url: string): Database {
+function openSqliteDatabase(url: string, busyTimeoutMs: number): SqliteDatabase {
   const filename = url.startsWith("file:") ? url.slice("file:".length) : url;
+  const isMemory = filename === ":memory:" || filename === "";
+
+  // Secure the file before the driver opens it: opening creates the file and
+  // applying the schema writes order-table content immediately.
+  if (!isMemory) setSqliteDatabasePermissions(filename);
+
   const db = new DatabaseSync(filename);
+  // Set the timeout before the schema write so startup and every later write
+  // use the same bounded policy.
+  setSqliteBusyTimeout(db, busyTimeoutMs);
   const schema = readFileSync(resolve(__dirname, "schema.sql"), "utf8");
   db.exec(schema);
+
+  // WAL/SHM files are usually created by the schema write above. Re-run after
+  // the schema so those sidecars are tightened in the same startup pass.
+  if (!isMemory) setSqliteDatabasePermissions(filename);
   return db;
 }
 

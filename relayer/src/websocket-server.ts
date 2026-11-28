@@ -41,43 +41,95 @@ export const DEFAULT_ALLOWED_ORIGINS =
 /** WebSocket close code for a policy violation (RFC 6455 §7.4.1). */
 export const WS_POLICY_VIOLATION = 1008;
 
-/**
- * Stable close code sent to a client that stopped answering heartbeats.
- * 4001 sits in the RFC 6455 §7.4.2 private-use range, so it cannot collide
- * with a protocol-defined code.
- */
 export const WS_HEARTBEAT_TIMEOUT_CODE = 4001;
+export const WS_PING_INTERVAL_MS = 30_000;
+export const WS_IDLE_TIMEOUT_MS = 60_000;
+export const WS_CLOSE_GRACE_MS = 5_000;
 
-/** Close reason paired with {@link WS_HEARTBEAT_TIMEOUT_CODE}. */
-export const WS_HEARTBEAT_TIMEOUT_REASON = 'heartbeat timeout';
+/**
+ * Maximum number of event subscriptions allowed per WebSocket connection.
+ * 
+ * This limit prevents a single client from consuming unbounded memory by
+ * creating an excessive number of subscriptions. The limit applies to the
+ * combined count of event types, order filters, resolver filters, and
+ * chain filters.
+ * 
+ * Can be overridden via WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION env var.
+ * 
+ * @default 1000
+ */
+export const DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION = 1000;
 
-/** Default ping cadence: one ping sweep every 30 seconds. */
-export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+/**
+ * Validate and return a subscription limit as a bounded whole integer.
+ * @param value - The value to validate (number or string)
+ * @param source - Description of the source for error messages
+ * @returns Validated integer limit
+ * @throws Error if the value is not a valid bounded positive integer
+ */
+export function validateSubscriptionLimit(value: number | string | undefined, source: string): number {
+  if (value === undefined) {
+    throw new Error(`${source}: limit is required`);
+  }
 
-/** Default idle window: one unanswered ping closes the socket. */
-export const DEFAULT_IDLE_TIMEOUT_MS = 2 * DEFAULT_HEARTBEAT_INTERVAL_MS;
+  let parsed: number;
 
-export interface HeartbeatOptions {
-  /** How often a protocol-level ping is sent to every connected client. */
-  heartbeatIntervalMs?: number;
-  /**
-   * Maximum time a client may go without a pong before it is closed. Must be
-   * greater than `heartbeatIntervalMs` so the client always gets a chance to
-   * answer at least one ping.
-   */
-  idleTimeoutMs?: number;
+  if (typeof value === 'string') {
+    // For strings, validate format before parsing to prevent partial numeric values like "123abc"
+    const trimmed = value.trim();
+    
+    // Check if the string contains only digits (and optional leading + or -)
+    // This prevents parseInt from accepting "123abc" as 123
+    if (!/^[+-]?\d+$/.test(trimmed)) {
+      throw new Error(`${source}: "${value}" is not a valid integer (contains non-numeric characters)`);
+    }
+    
+    parsed = parseInt(trimmed, 10);
+  } else {
+    parsed = value;
+  }
+
+  // Check if it's a valid number
+  if (isNaN(parsed)) {
+    throw new Error(`${source}: "${value}" is not a valid number`);
+  }
+
+  // Check if it's a whole integer (no decimals)
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`${source}: "${value}" must be a whole integer (no decimals)`);
+  }
+
+  // Check if it's positive
+  if (parsed < 1) {
+    throw new Error(`${source}: "${parsed}" must be a positive integer (at least 1)`);
+  }
+
+  // Check if it's within safe integer bounds
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${source}: "${parsed}" exceeds safe integer bounds (max ${Number.MAX_SAFE_INTEGER})`);
+  }
+
+  // Check reasonable upper bound (prevent absurd values)
+  const MAX_REASONABLE_LIMIT = 1_000_000;
+  if (parsed > MAX_REASONABLE_LIMIT) {
+    throw new Error(`${source}: "${parsed}" exceeds reasonable limit (max ${MAX_REASONABLE_LIMIT})`);
+  }
+
+  return parsed;
 }
 
-function positiveMilliseconds(
-  value: number | undefined,
-  fallback: number,
-  name: string
-): number {
-  if (value === undefined) return fallback;
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`${name} must be a positive number of milliseconds`);
+/**
+ * Parse the max subscriptions limit from environment or use default.
+ */
+export function getMaxSubscriptionsPerConnection(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = env.WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION;
+  if (!configured) return DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION;
+  
+  try {
+    return validateSubscriptionLimit(configured, 'WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION');
+  } catch (error) {
+    throw new Error(`Invalid WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return value;
 }
 
 /**
@@ -265,8 +317,8 @@ export interface WebSocketClient {
   orderFilters: Set<string>; // Specific order hashes
   resolverFilters: Set<string>; // Specific resolver addresses
   chainFilters: Set<number>; // Specific chain IDs
-  /** Unix ms of the most recent pong (or of the handshake before the first one). */
-  lastPongAt: number;
+  lastPing: number;
+  isAlive: boolean;
   metadata: {
     userAgent?: string;
     ip?: string;
@@ -290,34 +342,29 @@ export class FusionWebSocketServer extends EventEmitter {
   private clients: Map<string, WebSocketClient> = new Map();
   private eventHistory: EventRecord[] = [];
   private readonly MAX_HISTORY_SIZE = 1000;
-  private heartbeatTimer: NodeJS.Timeout | null = null;
-  private readonly heartbeatIntervalMs: number;
-  private readonly idleTimeoutMs: number;
+  private pingInterval: NodeJS.Timeout | null = null;
+  private readonly closeTimers = new Map<WebSocket, NodeJS.Timeout>();
   private isRunning = false;
   private readonly allowedOrigins: string[];
+  private readonly maxSubscriptionsPerConnection: number;
 
   constructor(
     private port: number = 3002,
     allowedOrigins: string[] = allowedOriginsFromEnv(),
-    heartbeat: HeartbeatOptions = {}
+    maxSubscriptionsPerConnection?: number
   ) {
     super();
     this.httpServer = createServer();
     this.allowedOrigins = allowedOrigins;
-    this.heartbeatIntervalMs = positiveMilliseconds(
-      heartbeat.heartbeatIntervalMs,
-      DEFAULT_HEARTBEAT_INTERVAL_MS,
-      'heartbeatIntervalMs'
-    );
-    this.idleTimeoutMs = positiveMilliseconds(
-      heartbeat.idleTimeoutMs,
-      DEFAULT_IDLE_TIMEOUT_MS,
-      'idleTimeoutMs'
-    );
-    // At or below the ping cadence the client would be dropped before it had a
-    // chance to answer even one ping.
-    if (this.idleTimeoutMs <= this.heartbeatIntervalMs) {
-      throw new Error('idleTimeoutMs must be greater than heartbeatIntervalMs');
+    
+    // Validate constructor-provided limit if present
+    if (maxSubscriptionsPerConnection !== undefined) {
+      this.maxSubscriptionsPerConnection = validateSubscriptionLimit(
+        maxSubscriptionsPerConnection,
+        'Constructor maxSubscriptionsPerConnection'
+      );
+    } else {
+      this.maxSubscriptionsPerConnection = getMaxSubscriptionsPerConnection();
     }
   }
 
@@ -347,7 +394,8 @@ export class FusionWebSocketServer extends EventEmitter {
       orderFilters: new Set(),
       resolverFilters: new Set(),
       chainFilters: new Set(),
-      lastPongAt: Date.now(),
+      lastPing: Date.now(),
+      isAlive: true,
       metadata: {
         userAgent: Array.isArray(userAgent) ? userAgent[0] : userAgent,
         ip: request.socket?.remoteAddress,
@@ -355,9 +403,10 @@ export class FusionWebSocketServer extends EventEmitter {
       }
     };
     this.clients.set(client.id, client);
-    this.ensureHeartbeat();
+    this.startPingInterval();
 
     socket.on('message', (raw: unknown) => {
+      if (!this.clients.has(client.id)) return;
       let message: WebSocketMessage;
       try {
         message = JSON.parse(String(raw));
@@ -368,13 +417,17 @@ export class FusionWebSocketServer extends EventEmitter {
       this.handleClientMessage(client, message);
     });
     socket.on('pong', () => {
-      client.lastPongAt = Date.now();
+      client.isAlive = true;
+      client.lastPing = Date.now();
     });
     socket.on('close', () => {
-      this.removeClient(client.id);
+      this.clearCloseTimer(socket);
+      this.detachClient(client);
     });
     socket.on('error', () => {
-      this.removeClient(client.id);
+      this.clearCloseTimer(socket);
+      this.detachClient(client);
+      if (socket.readyState !== 3) socket.terminate();
     });
 
     return client;
@@ -401,12 +454,12 @@ export class FusionWebSocketServer extends EventEmitter {
    */
   stop(): Promise<void> {
     return new Promise((resolve) => {
-      this.stopHeartbeat();
-
-      // Close all client connections
-      this.clients.forEach(client => {
-        client.socket.close();
-      });
+      this.stopPingInterval();
+      for (const socket of this.closeTimers.keys()) {
+        this.clearCloseTimer(socket);
+        socket.terminate();
+      }
+      this.clients.forEach(client => client.socket.terminate());
       this.clients.clear();
 
       this.httpServer.close(() => {
@@ -502,10 +555,62 @@ export class FusionWebSocketServer extends EventEmitter {
   }
 
   /**
+   * Calculate the total subscription count for a client.
+   * This includes event subscriptions and all filter types.
+   */
+  private getSubscriptionCount(client: WebSocketClient): number {
+    return (
+      client.subscriptions.size +
+      client.orderFilters.size +
+      client.resolverFilters.size +
+      client.chainFilters.size
+    );
+  }
+
+  /**
    * Handle event subscriptions
    */
   private handleSubscribe(client: WebSocketClient, id?: string, params?: any): void {
     const { events, orderHashes, resolvers, chainIds } = params || {};
+
+    // Deduplicate within the request and filter out already-subscribed items
+    // This ensures duplicates within a single request are counted only once
+    const newEvents = events && Array.isArray(events) 
+      ? Array.from(new Set(events)).filter(e => Object.values(EventType).includes(e) && !client.subscriptions.has(e))
+      : [];
+    const newOrderHashes = orderHashes && Array.isArray(orderHashes)
+      ? Array.from(new Set(orderHashes)).filter(h => !client.orderFilters.has(h))
+      : [];
+    const newResolvers = resolvers && Array.isArray(resolvers)
+      ? Array.from(new Set(resolvers)).filter(r => !client.resolverFilters.has(r))
+      : [];
+    const newChainIds = chainIds && Array.isArray(chainIds)
+      ? Array.from(new Set(chainIds)).filter(c => !client.chainFilters.has(c))
+      : [];
+
+    const currentCount = this.getSubscriptionCount(client);
+    const additionalCount = newEvents.length + newOrderHashes.length + newResolvers.length + newChainIds.length;
+    const projectedCount = currentCount + additionalCount;
+
+    // Enforce subscription limit
+    if (projectedCount > this.maxSubscriptionsPerConnection) {
+      this.sendError(
+        client,
+        -32000,
+        'Subscription limit exceeded',
+        {
+          current: currentCount,
+          requested: additionalCount,
+          limit: this.maxSubscriptionsPerConnection,
+          message: `Cannot add ${additionalCount} subscription(s). Current: ${currentCount}, Limit: ${this.maxSubscriptionsPerConnection}`
+        }
+      );
+      console.warn(
+        `⚠️ Client ${client.id} exceeded subscription limit: ` +
+        `current=${currentCount}, requested=${additionalCount}, limit=${this.maxSubscriptionsPerConnection}`
+      );
+      return;
+    }
 
     // Subscribe to events
     if (events && Array.isArray(events)) {
@@ -536,10 +641,12 @@ export class FusionWebSocketServer extends EventEmitter {
         orders: Array.from(client.orderFilters),
         resolvers: Array.from(client.resolverFilters),
         chains: Array.from(client.chainFilters)
-      }
+      },
+      subscriptionCount: this.getSubscriptionCount(client),
+      limit: this.maxSubscriptionsPerConnection
     });
 
-    console.log(`📡 Client ${client.id} subscribed to ${client.subscriptions.size} events`);
+    console.log(`📡 Client ${client.id} subscribed: count=${this.getSubscriptionCount(client)}/${this.maxSubscriptionsPerConnection}`);
   }
 
   /**
@@ -547,6 +654,7 @@ export class FusionWebSocketServer extends EventEmitter {
    */
   private handleUnsubscribe(client: WebSocketClient, id?: string, params?: any): void {
     const { events, orderHashes, resolvers, chainIds } = params || {};
+    const beforeCount = this.getSubscriptionCount(client);
 
     // Unsubscribe from events
     if (events && Array.isArray(events)) {
@@ -566,7 +674,19 @@ export class FusionWebSocketServer extends EventEmitter {
       chainIds.forEach(chainId => client.chainFilters.delete(chainId));
     }
 
-    this.sendResponse(client, id, { unsubscribed: true });
+    const afterCount = this.getSubscriptionCount(client);
+    const removed = beforeCount - afterCount;
+
+    this.sendResponse(client, id, {
+      unsubscribed: true,
+      removed,
+      subscriptionCount: afterCount,
+      limit: this.maxSubscriptionsPerConnection
+    });
+
+    if (removed > 0) {
+      console.log(`📡 Client ${client.id} unsubscribed: removed=${removed}, count=${afterCount}/${this.maxSubscriptionsPerConnection}`);
+    }
   }
 
   /**
@@ -699,70 +819,74 @@ export class FusionWebSocketServer extends EventEmitter {
    * Send error to client
    */
   private sendError(client: WebSocketClient, code: number, message: string, data?: any): void {
-    this.sendMessage(client, {
+    const errorMessage: WebSocketMessage = {
       error: { code, message }
-    });
-  }
-
-  /**
-   * Start the shared heartbeat sweep if it is not already running. The sweep
-   * exists only while at least one client is connected, so an idle relayer
-   * holds no timer at all.
-   */
-  private ensureHeartbeat(): void {
-    if (this.heartbeatTimer) return;
-    this.heartbeatTimer = setInterval(() => this.heartbeat(), this.heartbeatIntervalMs);
-    // The sweep must not be the reason the process stays alive.
-    this.heartbeatTimer.unref?.();
-  }
-
-  /** Stop the heartbeat sweep and drop its reference. Safe to call twice. */
-  private stopHeartbeat(): void {
-    if (!this.heartbeatTimer) return;
-    clearInterval(this.heartbeatTimer);
-    this.heartbeatTimer = null;
-  }
-
-  /**
-   * One heartbeat sweep: close clients whose last pong is older than the idle
-   * timeout, then ping everyone still alive. Clients are copied first because
-   * closing one mutates `clients`.
-   */
-  private heartbeat(): void {
-    const now = Date.now();
-    for (const client of [...this.clients.values()]) {
-      if (now - client.lastPongAt >= this.idleTimeoutMs) {
-        console.log(`💀 Closing unresponsive client after heartbeat timeout: ${client.id}`);
-        this.closeIdleClient(client);
-        continue;
-      }
-      try {
-        client.socket.ping();
-      } catch {
-        // A socket that cannot be pinged is already gone.
-        this.closeIdleClient(client);
-      }
+    };
+    if (data !== undefined) {
+      (errorMessage.error as any).data = data;
     }
+    this.sendMessage(client, errorMessage);
   }
 
   /**
-   * Remove an unresponsive client and close its socket with the stable
-   * heartbeat code so the peer can distinguish an idle eviction from a
-   * server shutdown (1001) or a policy refusal (1008).
+   * Start ping interval to keep connections alive
    */
+  private startPingInterval(): void {
+    if (this.pingInterval) return;
+    this.pingInterval = setInterval(() => {
+      this.clients.forEach(client => {
+        if (Date.now() - client.lastPing >= WS_IDLE_TIMEOUT_MS) {
+          this.closeIdleClient(client);
+          return;
+        }
+        try {
+          client.socket.ping();
+        } catch {
+          this.detachClient(client);
+          client.socket.terminate();
+        }
+      });
+    }, WS_PING_INTERVAL_MS);
+    this.pingInterval.unref();
+  }
+
+  private stopPingInterval(): void {
+    if (this.pingInterval) clearInterval(this.pingInterval);
+    this.pingInterval = null;
+  }
+
+  private detachClient(client: WebSocketClient): void {
+    if (!this.clients.delete(client.id)) return;
+    const count = this.getSubscriptionCount(client);
+    if (count > 0) {
+      console.log(`🔌 Client ${client.id} disconnected: released ${count} subscription(s)`);
+    }
+    if (this.clients.size === 0) this.stopPingInterval();
+  }
+
+  private clearCloseTimer(socket: WebSocket): void {
+    const timer = this.closeTimers.get(socket);
+    if (timer) clearTimeout(timer);
+    this.closeTimers.delete(socket);
+  }
+
   private closeIdleClient(client: WebSocketClient): void {
-    this.removeClient(client.id);
-    try {
-      client.socket.close(WS_HEARTBEAT_TIMEOUT_CODE, WS_HEARTBEAT_TIMEOUT_REASON);
-    } catch {
-      // The socket is already gone; removing the client is what matters.
-    }
-  }
+    this.detachClient(client);
+    const { socket } = client;
+    const timer = setTimeout(() => {
+      this.clearCloseTimer(socket);
+      if (socket.readyState !== 3) socket.terminate();
+    }, WS_CLOSE_GRACE_MS);
+    this.closeTimers.set(socket, timer);
+    timer.unref();
 
-  /** Unregister a client and stop the sweep once the last one disconnects. */
-  private removeClient(id: string): void {
-    if (!this.clients.delete(id)) return;
-    if (this.clients.size === 0) this.stopHeartbeat();
+    try {
+      socket.close(WS_HEARTBEAT_TIMEOUT_CODE, 'heartbeat timeout');
+      if (socket.readyState === 3) this.clearCloseTimer(socket);
+    } catch {
+      this.clearCloseTimer(socket);
+      socket.terminate();
+    }
   }
 
   // Public getters for monitoring

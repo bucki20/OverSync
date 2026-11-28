@@ -86,6 +86,43 @@ pnpm dev
 # Creates ./oversync.db on first startup if DATABASE_URL is unset or set to a SQLite path
 ```
 
+#### Busy timeout
+
+SQLite allows only one writer at a time. Each coordinator connection sets a
+bounded `busy_timeout` so a short lock (`VACUUM`, a backup, another process on
+the same file) is waited out, while a stuck writer cannot block a request
+forever. The default is **5000 ms** and can be overridden with
+`COORDINATOR_SQLITE_BUSY_TIMEOUT_MS`; values must be integers between **0** and
+**60000**, and an invalid value fails startup. `0` fails immediately instead of
+waiting. When the timeout expires the driver's `SQLITE_BUSY` error is replaced
+with `503 storage_unavailable` (`"Storage is temporarily unavailable"`) so the
+API does not leak the database path or lock details. PostgreSQL URLs ignore
+this setting.
+
+#### File permissions
+
+The database contains order state, so the coordinator creates it with
+owner-only permissions (`0600`) and tightens an existing database when it is
+opened. The same mode is applied to SQLite's `-wal`, `-shm` and `-journal`
+sidecars when they exist; sidecars SQLite creates later inherit the database
+file's mode. Permission changes happen before the schema or any order data is
+written, and a failure to apply them aborts startup rather than continuing
+with a readable database. `:memory:` databases are skipped.
+
+Platform behavior:
+
+- **Linux / macOS (POSIX):** `0600` is enforced as Unix file permissions. The
+  coordinator must run as the account that owns the database file; a deployment
+  that runs it as another user will fail to open or chmod the file.
+- **Windows:** Node's `chmod` only toggles the read-only attribute; it does not
+  grant or revoke entries in the file's NTFS ACL. On NTFS the file therefore
+  inherits the directory/service-account ACL rather than the POSIX owner bits.
+  Run the coordinator under a dedicated service account whose profile directory
+  is not accessible to other local users, and keep the database outside shared
+  folders. FAT/exFAT volumes do not support these protections.
+- **Containers:** mount the database on a volume with a private directory mode;
+  file modes on bind mounts are controlled by the host filesystem.
+
 ### PostgreSQL (Production)
 
 For production deployments, swap the database to Postgres by setting the

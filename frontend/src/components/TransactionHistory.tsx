@@ -5,6 +5,7 @@ import RefundDialog from '../features/refund/RefundDialog';
 import CopyableIdentifier from './CopyableIdentifier';
 import OrderStaleBanner from './OrderStaleBanner';
 import HtlcReceiptCard from './HtlcReceiptCard';
+import SafeExternalLink from './SafeExternalLink';
 import { classifyOrderFreshness } from '../lib/orderFreshness';
 import { buildHtlcReceipt } from '../lib/parseHtlcReceipt';
 import {
@@ -422,17 +423,6 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
         ))}
       </div>
 
-      {cursor && !isLoading && (
-        <button
-          onClick={refreshFromCoordinator}
-          disabled={isLoading}
-          className="button-hover-scale flex items-center justify-center gap-2 rounded-full border border-cyan-200/30 bg-cyan-200/[0.12] px-4 py-2 text-sm font-semibold text-cyan-50 shadow-[0_12px_34px_rgba(0,226,255,0.12)] transition hover:border-cyan-100/45 hover:bg-cyan-200/[0.18] disabled:opacity-60"
-        >
-          <ArrowRight className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
-          Load More
-        </button>
-      )}
-
       <div className="min-h-0 space-y-3 overflow-y-auto overscroll-contain pr-1">
         {filteredTransactions.length === 0 ? (
           <div className="rounded-2xl border border-white/10 bg-white/[0.035] py-12 text-center">
@@ -464,17 +454,15 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                 <div className="flex flex-wrap items-center gap-1.5">
                   {tx.ethTxHash && isRealHash(tx.ethTxHash) && (
                     <div className="flex items-center gap-1">
-                      <a
+                      <SafeExternalLink
                         href={getEtherscanUrl(tx.ethTxHash)}
-                        target="_blank"
-                        rel="noopener noreferrer"
                         className="flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.045] px-2.5 py-1 text-[11px] font-semibold text-slate-300 transition hover:bg-white/[0.08] hover:text-white"
                         title="View on Etherscan"
                       >
                         <img src="/images/eth.png" alt="ETH" className="h-3.5 w-3.5" />
                         <span>Etherscan</span>
                         <ExternalLink className="h-3 w-3 opacity-70" />
-                      </a>
+                      </SafeExternalLink>
                       <CopyableIdentifier
                         value={tx.ethTxHash}
                         hideDisplay
@@ -484,17 +472,15 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                   )}
                   {tx.stellarTxHash && isRealHash(tx.stellarTxHash) && (
                     <div className="flex items-center gap-1">
-                      <a
+                      <SafeExternalLink
                         href={getStellarExplorerUrl(tx.stellarTxHash)}
-                        target="_blank"
-                        rel="noopener noreferrer"
                         className="flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.045] px-2.5 py-1 text-[11px] font-semibold text-slate-300 transition hover:bg-white/[0.08] hover:text-white"
                         title="View on Stellar Expert"
                       >
                         <img src="/images/xlm.png" alt="XLM" className="h-3.5 w-3.5" />
                         <span>Stellar Expert</span>
                         <ExternalLink className="h-3.5 w-3.5 opacity-70" />
-                      </a>
+                      </SafeExternalLink>
                       <CopyableIdentifier
                         value={tx.stellarTxHash}
                         hideDisplay
@@ -565,10 +551,8 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                   )}
                   {tx.refundTxHash && (
                     <div className="flex items-center gap-1">
-                      <a
+                      <SafeExternalLink
                         href={getRefundExplorerUrl(tx)}
-                        target="_blank"
-                        rel="noopener noreferrer"
                         className="flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/25"
                         title={`Refund settled on ${getRefundNetworkLabel(tx)}. Click to view the refund transaction.`}
                       >
@@ -580,7 +564,7 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                           className="h-3.5 w-3.5"
                         />
                         <span>{getRefundNetworkLabel(tx)}</span>
-                      </a>
+                      </SafeExternalLink>
                       <CopyableIdentifier
                         value={tx.refundTxHash}
                         hideDisplay

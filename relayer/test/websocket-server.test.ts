@@ -1,12 +1,18 @@
-import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   FusionWebSocketServer,
   EventType,
-  WS_HEARTBEAT_TIMEOUT_CODE,
   WS_POLICY_VIOLATION,
+  WS_HEARTBEAT_TIMEOUT_CODE,
+  WS_PING_INTERVAL_MS,
+  WS_IDLE_TIMEOUT_MS,
+  WS_CLOSE_GRACE_MS,
   allowedOriginsFromEnv,
   isSocketOriginAllowed,
-  redactOutbound
+  redactOutbound,
+  DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+  getMaxSubscriptionsPerConnection,
+  validateSubscriptionLimit,
 } from "../src/websocket-server.js";
 
 // No server is started: sockets are in-memory fakes, so no port is bound.
@@ -20,11 +26,10 @@ class FakeSocket {
   sent: string[] = [];
   closed: { code?: number; reason?: string } | null = null;
   private handlers = new Map<string, (...args: any[]) => void>();
-  pings = 0;
   send(data: string) { this.sent.push(data); }
   close(code?: number, reason?: string) { this.closed = { code, reason }; this.readyState = 3; }
   terminate() { this.readyState = 3; }
-  ping() { this.pings++; }
+  ping() {}
   on(event: string, cb: (...args: any[]) => void) { this.handlers.set(event, cb); }
   emit(event: string, ...args: any[]) { this.handlers.get(event)?.(...args); }
 }
@@ -43,6 +48,52 @@ function subscribe(socket: FakeSocket) {
 
 const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 afterEach(() => logSpy.mockClear());
+
+describe("FusionWebSocketServer heartbeat", () => {
+  it("pings connected peers and gives a stalled peer a bounded close handshake", () => {
+    vi.useFakeTimers();
+    try {
+      const server = new FusionWebSocketServer(0, [ALLOWED]);
+      const { socket } = connect(server, ALLOWED);
+      const ping = vi.spyOn(socket, "ping");
+      const close = vi.spyOn(socket, "close").mockImplementation(() => {});
+      const terminate = vi.spyOn(socket, "terminate");
+
+      vi.advanceTimersByTime(WS_PING_INTERVAL_MS);
+      expect(ping).toHaveBeenCalledOnce();
+      expect(close).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(WS_IDLE_TIMEOUT_MS - WS_PING_INTERVAL_MS);
+      expect(close).toHaveBeenCalledWith(WS_HEARTBEAT_TIMEOUT_CODE, "heartbeat timeout");
+      expect(server.getClientCount()).toBe(0);
+      expect(terminate).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(WS_CLOSE_GRACE_MS);
+      expect(terminate).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("extends the idle window on pong and cancels timers on disconnect", () => {
+    vi.useFakeTimers();
+    try {
+      const server = new FusionWebSocketServer(0, [ALLOWED]);
+      const { socket } = connect(server, ALLOWED);
+      vi.advanceTimersByTime(WS_PING_INTERVAL_MS);
+      socket.emit("pong");
+      vi.advanceTimersByTime(WS_PING_INTERVAL_MS);
+      expect(server.getClientCount()).toBe(1);
+      expect(socket.closed).toBeNull();
+      socket.emit("close");
+      expect(server.getClientCount()).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("FusionWebSocketServer origin policy", () => {
   it("lets an allowed origin receive an order status", () => {
@@ -135,87 +186,1004 @@ describe("FusionWebSocketServer outbound redaction", () => {
   });
 });
 
-describe("FusionWebSocketServer heartbeat", () => {
-  const HEARTBEAT = { heartbeatIntervalMs: 1_000, idleTimeoutMs: 3_000 };
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  function heartbeatServer() {
-    return new FusionWebSocketServer(0, [ALLOWED], HEARTBEAT);
-  }
-
-  it("pings connected clients on every heartbeat interval", () => {
-    const server = heartbeatServer();
-    const { client, socket } = connect(server, ALLOWED);
+describe("FusionWebSocketServer subscription limits", () => {
+  it("enforces the default subscription limit per connection", () => {
+    const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+    const { socket, client } = connect(server, ALLOWED);
     expect(client).not.toBeNull();
 
-    vi.advanceTimersByTime(1_000);
-    expect(socket.pings).toBe(1);
-    expect(socket.closed).toBeNull();
-    expect(server.getClientCount()).toBe(1);
+    // Subscribe to 8 events (within limit)
+    socket.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 8)
+      }
+    }));
+
+    expect(socket.sent).toHaveLength(1);
+    let reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.subscribed).toBe(true);
+    expect(reply.result.subscriptionCount).toBe(8);
+    expect(reply.result.limit).toBe(10);
+    socket.sent.length = 0;
+
+    // Add 2 order filters (at limit: 8 + 2 = 10)
+    socket.emit("message", JSON.stringify({
+      id: "2",
+      method: "subscribe",
+      params: {
+        orderHashes: ["0xorder1", "0xorder2"]
+      }
+    }));
+
+    expect(socket.sent).toHaveLength(1);
+    reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.subscribed).toBe(true);
+    expect(reply.result.subscriptionCount).toBe(10);
+    socket.sent.length = 0;
+
+    // Try to add 1 more (should be rejected: 10 + 1 = 11 > 10)
+    socket.emit("message", JSON.stringify({
+      id: "3",
+      method: "subscribe",
+      params: {
+        chainIds: [1]
+      }
+    }));
+
+    expect(socket.sent).toHaveLength(1);
+    reply = JSON.parse(socket.sent[0]);
+    expect(reply.error).toBeDefined();
+    expect(reply.error.code).toBe(-32000);
+    expect(reply.error.message).toBe("Subscription limit exceeded");
+    expect(reply.error.data.current).toBe(10);
+    expect(reply.error.data.requested).toBe(1);
+    expect(reply.error.data.limit).toBe(10);
   });
 
-  it("keeps a client that answers pings alive", () => {
-    const server = heartbeatServer();
-    const { socket } = connect(server, ALLOWED);
+  it("releases subscription count on unsubscribe", () => {
+    const server = new FusionWebSocketServer(0, [ALLOWED], 5);
+    const { socket, client } = connect(server, ALLOWED);
+    expect(client).not.toBeNull();
 
-    for (let sweep = 0; sweep < 10; sweep++) {
-      vi.advanceTimersByTime(1_000);
-      socket.emit("pong");
-    }
+    // Subscribe to 5 events (at limit)
+    socket.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 5)
+      }
+    }));
 
-    expect(socket.pings).toBe(10);
-    expect(socket.closed).toBeNull();
-    expect(server.getClientCount()).toBe(1);
+    let reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.subscriptionCount).toBe(5);
+    socket.sent.length = 0;
+
+    // Unsubscribe from 2 events
+    socket.emit("message", JSON.stringify({
+      id: "2",
+      method: "unsubscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 2)
+      }
+    }));
+
+    reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.unsubscribed).toBe(true);
+    expect(reply.result.removed).toBe(2);
+    expect(reply.result.subscriptionCount).toBe(3);
+    socket.sent.length = 0;
+
+    // Now can subscribe to 2 more
+    socket.emit("message", JSON.stringify({
+      id: "3",
+      method: "subscribe",
+      params: {
+        orderHashes: ["0xorder1", "0xorder2"]
+      }
+    }));
+
+    reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.subscribed).toBe(true);
+    expect(reply.result.subscriptionCount).toBe(5);
   });
 
-  it("closes a client that never answers with the stable close code", () => {
-    const server = heartbeatServer();
-    const { socket } = connect(server, ALLOWED);
+  it("releases subscription count on disconnect", () => {
+    const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+    const { socket: socket1, client: client1 } = connect(server, ALLOWED);
+    expect(client1).not.toBeNull();
 
-    // 1s and 2s send pings; at 3s the idle window has elapsed.
-    vi.advanceTimersByTime(3_000);
+    // Client 1 subscribes to 8 items
+    socket1.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 8)
+      }
+    }));
 
-    expect(socket.closed).toEqual({
-      code: WS_HEARTBEAT_TIMEOUT_CODE,
-      reason: "heartbeat timeout"
+    let reply = JSON.parse(socket1.sent[0]);
+    expect(reply.result.subscriptionCount).toBe(8);
+
+    // Client 1 disconnects
+    socket1.emit("close");
+
+    expect(server.getClientCount()).toBe(0);
+
+    // New client can now connect and use subscriptions
+    const { socket: socket2, client: client2 } = connect(server, ALLOWED);
+    expect(client2).not.toBeNull();
+
+    socket2.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 10)
+      }
+    }));
+
+    reply = JSON.parse(socket2.sent[0]);
+    expect(reply.result.subscribed).toBe(true);
+    expect(reply.result.subscriptionCount).toBe(10);
+  });
+
+  it("counts all subscription types toward the limit", () => {
+    const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+    const { socket, client } = connect(server, ALLOWED);
+    expect(client).not.toBeNull();
+
+    // Subscribe to a mix: 3 events + 3 orders + 2 resolvers + 2 chains = 10
+    socket.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 3),
+        orderHashes: ["0xorder1", "0xorder2", "0xorder3"],
+        resolvers: ["0xresolver1", "0xresolver2"],
+        chainIds: [1, 11155111]
+      }
+    }));
+
+    expect(socket.sent).toHaveLength(1);
+    const reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.subscribed).toBe(true);
+    expect(reply.result.subscriptionCount).toBe(10);
+    expect(reply.result.events).toHaveLength(3);
+    expect(reply.result.filters.orders).toHaveLength(3);
+    expect(reply.result.filters.resolvers).toHaveLength(2);
+    expect(reply.result.filters.chains).toHaveLength(2);
+  });
+
+  it("does not count duplicate subscriptions toward the limit", () => {
+    const server = new FusionWebSocketServer(0, [ALLOWED], 5);
+    const { socket, client } = connect(server, ALLOWED);
+    expect(client).not.toBeNull();
+
+    // Subscribe to 3 events
+    socket.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 3)
+      }
+    }));
+
+    let reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.subscriptionCount).toBe(3);
+    socket.sent.length = 0;
+
+    // Try to subscribe to same 3 events again (should not increase count)
+    socket.emit("message", JSON.stringify({
+      id: "2",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 3)
+      }
+    }));
+
+    reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.subscribed).toBe(true);
+    expect(reply.result.subscriptionCount).toBe(3); // Still 3, not 6
+  });
+
+  it("allows exactly the limit subscriptions", () => {
+    const server = new FusionWebSocketServer(0, [ALLOWED], 3);
+    const { socket, client } = connect(server, ALLOWED);
+    expect(client).not.toBeNull();
+
+    socket.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 3)
+      }
+    }));
+
+    const reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.subscribed).toBe(true);
+    expect(reply.result.subscriptionCount).toBe(3);
+    expect(reply.error).toBeUndefined();
+  });
+
+  it("rejects when adding multiple items that would exceed limit", () => {
+    const server = new FusionWebSocketServer(0, [ALLOWED], 5);
+    const { socket, client } = connect(server, ALLOWED);
+    expect(client).not.toBeNull();
+
+    // Subscribe to 3 events
+    socket.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: Object.values(EventType).slice(0, 3)
+      }
+    }));
+
+    expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(3);
+    socket.sent.length = 0;
+
+    // Try to add 5 order hashes (3 + 5 = 8 > 5 limit)
+    socket.emit("message", JSON.stringify({
+      id: "2",
+      method: "subscribe",
+      params: {
+        orderHashes: ["0xa", "0xb", "0xc", "0xd", "0xe"]
+      }
+    }));
+
+    const reply = JSON.parse(socket.sent[0]);
+    expect(reply.error).toBeDefined();
+    expect(reply.error.code).toBe(-32000);
+    expect(reply.error.data.current).toBe(3);
+    expect(reply.error.data.requested).toBe(5);
+  });
+
+  it("uses default limit when not specified", () => {
+    const server = new FusionWebSocketServer(0, [ALLOWED]);
+    const { socket, client } = connect(server, ALLOWED);
+    expect(client).not.toBeNull();
+
+    socket.emit("message", JSON.stringify({
+      id: "1",
+      method: "subscribe",
+      params: {
+        events: [EventType.OrderCreated]
+      }
+    }));
+
+    const reply = JSON.parse(socket.sent[0]);
+    expect(reply.result.limit).toBe(DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION);
+  });
+
+  it("parses limit from environment variable", () => {
+    expect(getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "500" })).toBe(500);
+    expect(getMaxSubscriptionsPerConnection({})).toBe(DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION);
+  });
+
+  it("throws on invalid environment variable", () => {
+    expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "invalid" }))
+      .toThrow(/Invalid WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION/);
+    expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "0" }))
+      .toThrow(/Must be a positive integer/);
+    expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "-10" }))
+      .toThrow(/Must be a positive integer/);
+  });
+
+  describe("duplicate subscription handling", () => {
+    it("ignores duplicate event subscriptions", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Subscribe to same event multiple times in one request
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: [EventType.OrderCreated, EventType.OrderCreated, EventType.OrderFilled]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscriptionCount).toBe(2); // Only 2 unique events
+      expect(reply.result.events).toHaveLength(2);
     });
-    expect(server.getClientCount()).toBe(0);
 
-    // The sweep stops once the last client is gone.
-    const pingsAtClose = socket.pings;
-    vi.advanceTimersByTime(10_000);
-    expect(socket.pings).toBe(pingsAtClose);
+    it("ignores duplicate order hash filters", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Subscribe with duplicate order hashes
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: [EventType.OrderCreated],
+          orderHashes: ["0xorder1", "0xorder1", "0xorder2"]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscriptionCount).toBe(3); // 1 event + 2 unique orders
+      expect(reply.result.filters.orders).toHaveLength(2);
+    });
+
+    it("ignores duplicate resolver filters", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: [EventType.OrderFilled],
+          resolvers: ["0xabc", "0xabc", "0xdef", "0xdef"]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscriptionCount).toBe(3); // 1 event + 2 unique resolvers
+      expect(reply.result.filters.resolvers).toHaveLength(2);
+    });
+
+    it("ignores duplicate chain ID filters", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: [EventType.OrderCreated],
+          chainIds: [1, 1, 11155111, 11155111, 1]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscriptionCount).toBe(3); // 1 event + 2 unique chains
+      expect(reply.result.filters.chains).toHaveLength(2);
+    });
+
+    it("ignores duplicates when resubscribing", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // First subscription
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: [EventType.OrderCreated, EventType.OrderFilled],
+          orderHashes: ["0xorder1"]
+        }
+      }));
+
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(3);
+      socket.sent.length = 0;
+
+      // Second subscription with overlapping items
+      socket.emit("message", JSON.stringify({
+        id: "2",
+        method: "subscribe",
+        params: {
+          events: [EventType.OrderFilled, EventType.OrderCancelled], // OrderFilled is duplicate
+          orderHashes: ["0xorder1", "0xorder2"] // 0xorder1 is duplicate
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscriptionCount).toBe(5); // 3 events + 2 orders (only +2 new)
+      expect(reply.result.subscribed).toBe(true);
+    });
+
+    it("handles duplicates across all filter types in single request", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 20);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Single request with duplicates in all filter types
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: [
+            EventType.OrderCreated,
+            EventType.OrderFilled,
+            EventType.OrderCreated,  // duplicate
+            EventType.OrderFilled,   // duplicate
+            EventType.OrderCancelled
+          ],
+          orderHashes: [
+            "0xorder1",
+            "0xorder2",
+            "0xorder1",  // duplicate
+            "0xorder3",
+            "0xorder2"   // duplicate
+          ],
+          resolvers: [
+            "0xresolver1",
+            "0xresolver2",
+            "0xresolver1",  // duplicate
+            "0xresolver3"
+          ],
+          chainIds: [
+            1,
+            11155111,
+            1,       // duplicate
+            137,
+            11155111 // duplicate
+          ]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscribed).toBe(true);
+      // Should count only unique values:
+      // 3 unique events + 3 unique orders + 3 unique resolvers + 3 unique chains = 12
+      expect(reply.result.subscriptionCount).toBe(12);
+      expect(reply.result.events).toHaveLength(3);
+      expect(reply.result.filters.orders).toHaveLength(3);
+      expect(reply.result.filters.resolvers).toHaveLength(3);
+      expect(reply.result.filters.chains).toHaveLength(3);
+    });
+
+    it("accepts duplicate-bearing request that fits exactly at limit after deduplication", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Request with 20 total items (many duplicates) but only 10 unique
+      // Should succeed because after deduplication, exactly 10 items remain
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: [
+            EventType.OrderCreated,
+            EventType.OrderCreated,  // duplicate
+            EventType.OrderFilled,
+            EventType.OrderFilled,   // duplicate
+            EventType.OrderCancelled,
+            EventType.OrderCancelled // duplicate
+          ],
+          orderHashes: [
+            "0xa", "0xa", "0xa",  // 3 duplicates -> 1 unique
+            "0xb", "0xb",          // 2 duplicates -> 1 unique
+            "0xc", "0xc"           // 2 duplicates -> 1 unique
+          ],
+          resolvers: [
+            "0x1", "0x1", "0x1",  // 3 duplicates -> 1 unique
+            "0x2", "0x2"          // 2 duplicates -> 1 unique
+          ],
+          chainIds: [
+            1, 1, 1,              // 3 duplicates -> 1 unique
+            137, 137              // 2 duplicates -> 1 unique
+          ]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscribed).toBe(true);
+      // 3 unique events + 3 unique orders + 2 unique resolvers + 2 unique chains = 10 (exactly at limit)
+      expect(reply.result.subscriptionCount).toBe(10);
+      expect(reply.result.limit).toBe(10);
+      expect(reply.error).toBeUndefined();
+    });
+
+    it("rejects duplicate-bearing request that exceeds limit after deduplication", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Request with many items, but 11 unique after deduplication
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: [
+            EventType.OrderCreated, EventType.OrderCreated,
+            EventType.OrderFilled, EventType.OrderFilled,
+            EventType.OrderCancelled, EventType.OrderCancelled
+          ], // 3 unique
+          orderHashes: [
+            "0xa", "0xa", "0xb", "0xb", "0xc", "0xc", 
+            "0xd", "0xd", "0xe"  // 5 unique
+          ],
+          chainIds: [
+            1, 1, 137, 137, 11155111  // 3 unique
+          ]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.error).toBeDefined();
+      expect(reply.error.code).toBe(-32000);
+      expect(reply.error.message).toBe("Subscription limit exceeded");
+      expect(reply.error.data.requested).toBe(11); // 3 + 5 + 3 unique items
+      expect(reply.error.data.limit).toBe(10);
+    });
   });
 
-  it("clears the heartbeat timer when the last client disconnects", () => {
-    const server = heartbeatServer();
-    const { socket } = connect(server, ALLOWED);
+  describe("capacity release on unsubscribe", () => {
+    it("releases capacity for each filter type on unsubscribe", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 20);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
 
-    vi.advanceTimersByTime(1_000);
-    expect(socket.pings).toBe(1);
+      // Subscribe to multiple types
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: Object.values(EventType).slice(0, 5),
+          orderHashes: ["0xa", "0xb", "0xc"],
+          resolvers: ["0x1", "0x2"],
+          chainIds: [1, 11155111, 137]
+        }
+      }));
 
-    socket.emit("close");
-    expect(server.getClientCount()).toBe(0);
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(13); // 5+3+2+3
+      socket.sent.length = 0;
 
-    vi.advanceTimersByTime(10_000);
-    expect(socket.pings).toBe(1);
+      // Unsubscribe from some of each type
+      socket.emit("message", JSON.stringify({
+        id: "2",
+        method: "unsubscribe",
+        params: {
+          events: Object.values(EventType).slice(0, 2),
+          orderHashes: ["0xb"],
+          resolvers: ["0x2"],
+          chainIds: [137]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.removed).toBe(5); // 2 events + 1 order + 1 resolver + 1 chain
+      expect(reply.result.subscriptionCount).toBe(8); // 13 - 5
+    });
+
+    it("allows immediate resubscription after unsubscribe", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 5);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Fill to capacity
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { orderHashes: ["0xa", "0xb", "0xc", "0xd", "0xe"] }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(5);
+      socket.sent.length = 0;
+
+      // Unsubscribe 3
+      socket.emit("message", JSON.stringify({
+        id: "2",
+        method: "unsubscribe",
+        params: { orderHashes: ["0xa", "0xb", "0xc"] }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(2);
+      socket.sent.length = 0;
+
+      // Immediately subscribe to 3 new ones
+      socket.emit("message", JSON.stringify({
+        id: "3",
+        method: "subscribe",
+        params: { orderHashes: ["0xf", "0xg", "0xh"] }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscribed).toBe(true);
+      expect(reply.result.subscriptionCount).toBe(5);
+      expect(reply.error).toBeUndefined();
+    });
+
+    it("handles unsubscribing from non-existent items gracefully", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Subscribe to some items
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { events: [EventType.OrderCreated] }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(1);
+      socket.sent.length = 0;
+
+      // Unsubscribe from items that were never subscribed
+      socket.emit("message", JSON.stringify({
+        id: "2",
+        method: "unsubscribe",
+        params: {
+          events: [EventType.OrderFilled], // Not subscribed
+          orderHashes: ["0xnever"] // Not subscribed
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.unsubscribed).toBe(true);
+      expect(reply.result.removed).toBe(0);
+      expect(reply.result.subscriptionCount).toBe(1); // Unchanged
+    });
   });
 
-  it("clears all timers on shutdown and closes connected sockets", async () => {
-    const server = heartbeatServer();
-    const { socket } = connect(server, ALLOWED);
+  describe("capacity release on disconnect", () => {
+    it("fully releases capacity when client disconnects", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 15);
+      const { socket: s1, client: c1 } = connect(server, ALLOWED);
+      expect(c1).not.toBeNull();
 
-    await server.stop();
+      // Client 1 uses 10 subscriptions
+      s1.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: Object.values(EventType).slice(0, 6),
+          orderHashes: ["0xa", "0xb"],
+          chainIds: [1, 137]
+        }
+      }));
 
-    expect(socket.closed).not.toBeNull();
-    vi.advanceTimersByTime(10_000);
-    expect(socket.pings).toBe(0);
+      expect(JSON.parse(s1.sent[0]).result.subscriptionCount).toBe(10);
+      expect(server.getClientCount()).toBe(1);
+
+      // Disconnect client 1
+      s1.emit("close");
+      expect(server.getClientCount()).toBe(0);
+
+      // New client should have full capacity available
+      const { socket: s2, client: c2 } = connect(server, ALLOWED);
+      expect(c2).not.toBeNull();
+
+      s2.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { orderHashes: Array.from({ length: 15 }, (_, i) => `0x${i}`) }
+      }));
+
+      const reply = JSON.parse(s2.sent[0]);
+      expect(reply.result.subscribed).toBe(true);
+      expect(reply.result.subscriptionCount).toBe(15);
+      expect(reply.error).toBeUndefined();
+    });
+
+    it("releases capacity for multiple disconnecting clients independently", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      
+      // Connect 3 clients
+      const { socket: s1, client: c1 } = connect(server, ALLOWED);
+      const { socket: s2, client: c2 } = connect(server, ALLOWED);
+      const { socket: s3, client: c3 } = connect(server, ALLOWED);
+
+      // Each client subscribes to different amounts
+      s1.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { events: Object.values(EventType).slice(0, 5) }
+      }));
+      s2.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { events: Object.values(EventType).slice(0, 3) }
+      }));
+      s3.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { events: Object.values(EventType).slice(0, 7) }
+      }));
+
+      expect(server.getClientCount()).toBe(3);
+
+      // Disconnect client 2 (middle one)
+      s2.emit("close");
+      expect(server.getClientCount()).toBe(2);
+
+      // Clients 1 and 3 should still be connected with their subscriptions
+      const clientsInfo = server.getClientInfo();
+      expect(clientsInfo).toHaveLength(2);
+      expect(clientsInfo[0].subscriptions).toHaveLength(5);
+      expect(clientsInfo[1].subscriptions).toHaveLength(7);
+    });
+
+    it("logs subscription release count on disconnect", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Subscribe to 7 items
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: Object.values(EventType).slice(0, 5),
+          orderHashes: ["0xa", "0xb"]
+        }
+      }));
+
+      logSpy.mockClear();
+      socket.emit("close");
+
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/Client .+ disconnected: released 7 subscription\(s\)/)
+      );
+    });
+
+    it("does not log on disconnect if client had no subscriptions", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Don't subscribe to anything
+      logSpy.mockClear();
+      socket.emit("close");
+
+      // Should not log release message
+      expect(logSpy).not.toHaveBeenCalledWith(
+        expect.stringMatching(/released.*subscription/)
+      );
+    });
+  });
+
+  describe("shared limit across filter types", () => {
+    it("respects shared limit across all filter types", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Add 3 events
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { events: Object.values(EventType).slice(0, 3) }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(3);
+      socket.sent.length = 0;
+
+      // Add 3 order filters
+      socket.emit("message", JSON.stringify({
+        id: "2",
+        method: "subscribe",
+        params: { orderHashes: ["0xa", "0xb", "0xc"] }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(6);
+      socket.sent.length = 0;
+
+      // Add 2 resolver filters
+      socket.emit("message", JSON.stringify({
+        id: "3",
+        method: "subscribe",
+        params: { resolvers: ["0x1", "0x2"] }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(8);
+      socket.sent.length = 0;
+
+      // Add 2 chain filters (at limit: 3+3+2+2=10)
+      socket.emit("message", JSON.stringify({
+        id: "4",
+        method: "subscribe",
+        params: { chainIds: [1, 11155111] }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(10);
+      socket.sent.length = 0;
+
+      // Try to add 1 more of ANY type - should be rejected
+      socket.emit("message", JSON.stringify({
+        id: "5",
+        method: "subscribe",
+        params: { events: [EventType.OrderCancelled] }
+      }));
+
+      let reply = JSON.parse(socket.sent[0]);
+      expect(reply.error).toBeDefined();
+      expect(reply.error.code).toBe(-32000);
+      socket.sent.length = 0;
+
+      // Try to add order filter - also rejected
+      socket.emit("message", JSON.stringify({
+        id: "6",
+        method: "subscribe",
+        params: { orderHashes: ["0xnew"] }
+      }));
+
+      reply = JSON.parse(socket.sent[0]);
+      expect(reply.error).toBeDefined();
+      expect(reply.error.code).toBe(-32000);
+    });
+
+    it("allows mixed filter types up to exactly the limit", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 12);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Subscribe to exactly 12 items mixed across all types
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: {
+          events: Object.values(EventType).slice(0, 4),     // 4
+          orderHashes: ["0xa", "0xb", "0xc"],               // 3
+          resolvers: ["0x1", "0x2"],                        // 2
+          chainIds: [1, 11155111, 137]                      // 3
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscribed).toBe(true);
+      expect(reply.result.subscriptionCount).toBe(12);
+      expect(reply.error).toBeUndefined();
+    });
+
+    it("enforces limit when mixing subscriptions across multiple requests", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 8);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Request 1: 3 events
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { events: Object.values(EventType).slice(0, 3) }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(3);
+      socket.sent.length = 0;
+
+      // Request 2: 2 orders
+      socket.emit("message", JSON.stringify({
+        id: "2",
+        method: "subscribe",
+        params: { orderHashes: ["0xa", "0xb"] }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(5);
+      socket.sent.length = 0;
+
+      // Request 3: 3 chains (total 8, at limit)
+      socket.emit("message", JSON.stringify({
+        id: "3",
+        method: "subscribe",
+        params: { chainIds: [1, 137, 11155111] }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(8);
+      socket.sent.length = 0;
+
+      // Request 4: 1 resolver (would exceed)
+      socket.emit("message", JSON.stringify({
+        id: "4",
+        method: "subscribe",
+        params: { resolvers: ["0x1"] }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.error).toBeDefined();
+      expect(reply.error.code).toBe(-32000);
+      expect(reply.error.data.current).toBe(8);
+      expect(reply.error.data.limit).toBe(8);
+    });
+
+    it("allows adding to different filter types after partial unsubscribe", () => {
+      const server = new FusionWebSocketServer(0, [ALLOWED], 10);
+      const { socket, client } = connect(server, ALLOWED);
+      expect(client).not.toBeNull();
+
+      // Fill to capacity with events only
+      socket.emit("message", JSON.stringify({
+        id: "1",
+        method: "subscribe",
+        params: { events: Object.values(EventType).slice(0, 10) }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(10);
+      socket.sent.length = 0;
+
+      // Unsubscribe from 4 events
+      socket.emit("message", JSON.stringify({
+        id: "2",
+        method: "unsubscribe",
+        params: { events: Object.values(EventType).slice(0, 4) }
+      }));
+      expect(JSON.parse(socket.sent[0]).result.subscriptionCount).toBe(6);
+      socket.sent.length = 0;
+
+      // Now add 4 items of different types
+      socket.emit("message", JSON.stringify({
+        id: "3",
+        method: "subscribe",
+        params: {
+          orderHashes: ["0xa", "0xb"],
+          resolvers: ["0x1"],
+          chainIds: [1]
+        }
+      }));
+
+      const reply = JSON.parse(socket.sent[0]);
+      expect(reply.result.subscribed).toBe(true);
+      expect(reply.result.subscriptionCount).toBe(10);
+      expect(reply.error).toBeUndefined();
+    });
+  });
+
+  describe("limit validation", () => {
+    it("validates constructor limit as positive integer", () => {
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], 0))
+        .toThrow(/must be a positive integer/);
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], -5))
+        .toThrow(/must be a positive integer/);
+    });
+
+    it("validates constructor limit as whole integer", () => {
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], 10.5))
+        .toThrow(/must be a whole integer/);
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], 3.14159))
+        .toThrow(/must be a whole integer/);
+    });
+
+    it("rejects non-numeric constructor limit", () => {
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], NaN))
+        .toThrow(/not a valid number/);
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], "abc" as any))
+        .toThrow(/not a valid integer.*non-numeric characters/);
+    });
+
+    it("validates environment limit as positive integer", () => {
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "0" }))
+        .toThrow(/must be a positive integer/);
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "-100" }))
+        .toThrow(/must be a positive integer/);
+    });
+
+    it("validates environment limit as whole integer", () => {
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "10.5" }))
+        .toThrow(/must be a whole integer/);
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "99.999" }))
+        .toThrow(/must be a whole integer/);
+    });
+
+    it("rejects exceeds safe integer bounds", () => {
+      const tooLarge = (Number.MAX_SAFE_INTEGER + 1).toString();
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: tooLarge }))
+        .toThrow(/exceeds safe integer bounds/);
+    });
+
+    it("rejects unreasonably large values", () => {
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "10000000" }))
+        .toThrow(/exceeds reasonable limit/);
+    });
+
+    it("rejects partially numeric environment values", () => {
+      // These should be rejected before parseInt can parse them
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "123abc" }))
+        .toThrow(/not a valid integer.*non-numeric characters/);
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "100.5extra" }))
+        .toThrow(/not a valid integer.*non-numeric characters/);
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "50 units" }))
+        .toThrow(/not a valid integer.*non-numeric characters/);
+      expect(() => getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "0x64" }))
+        .toThrow(/not a valid integer.*non-numeric characters/);
+    });
+
+    it("accepts valid integer limits", () => {
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], 1)).not.toThrow();
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], 100)).not.toThrow();
+      expect(() => new FusionWebSocketServer(0, [ALLOWED], 10000)).not.toThrow();
+      
+      expect(getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "1" })).toBe(1);
+      expect(getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "500" })).toBe(500);
+      expect(getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "999999" })).toBe(999999);
+    });
+
+    it("accepts string integers with whitespace", () => {
+      expect(getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "  100  " })).toBe(100);
+      expect(getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "\t500\n" })).toBe(500);
+    });
+
+    it("accepts string integers with explicit positive sign", () => {
+      expect(getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "+100" })).toBe(100);
+      expect(getMaxSubscriptionsPerConnection({ WEBSOCKET_MAX_SUBSCRIPTIONS_PER_CONNECTION: "+500" })).toBe(500);
+    });
   });
 });

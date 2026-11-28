@@ -2,6 +2,12 @@ import { config as dotenvConfig } from "dotenv";
 import { resolve } from "node:path";
 import { z } from "zod";
 import { resolveEthereumRpcUrl } from "./ethereum-rpc-url.js";
+import {
+  DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+  MAX_SQLITE_BUSY_TIMEOUT_MS,
+  MIN_SQLITE_BUSY_TIMEOUT_MS
+} from "./persistence/db.js";
+import { serverTimeoutsFromEnv, serverTimeoutsSchema } from "./server/timeouts.js";
 
 dotenvConfig({ path: resolve(process.cwd(), ".env") });
 
@@ -17,8 +23,18 @@ const configSchema = z.object({
     .string()
     .default("http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"),
   pollIntervalMs: z.coerce.number().int().positive().default(15_000),
+  /**
+   * Bounded SQLite lock wait in milliseconds. 0 fails immediately; the upper
+   * bound prevents indefinite-looking stalls on lock contention.
+   */
+  sqliteBusyTimeoutMs: z
+    .string()
+    .regex(/^\d+$/, "Expected an integer number of milliseconds")
+    .pipe(z.coerce.number().int().min(MIN_SQLITE_BUSY_TIMEOUT_MS).max(MAX_SQLITE_BUSY_TIMEOUT_MS)),
   /** Maximum allowed JSON request body size in bytes. Default: 64 KiB. */
   maxRequestBodyBytes: z.coerce.number().int().positive().default(65_536),
+  /** Hard limits on how long a client may hold a connection. See server/timeouts.ts. */
+  serverTimeouts: serverTimeoutsSchema,
   // Opt-in fixture mode. We previously used `z.coerce.boolean()`, which
   // is unsafe because `Boolean("false") === true` — meaning the
   // default `"false"` literal from the env fallback would re-enable
@@ -81,7 +97,10 @@ export function loadConfig(): CoordinatorConfig {
       process.env.CORS_ORIGIN ??
       "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173",
     pollIntervalMs: process.env.COORDINATOR_POLL_INTERVAL_MS ?? "15000",
+    sqliteBusyTimeoutMs:
+      process.env.COORDINATOR_SQLITE_BUSY_TIMEOUT_MS ?? String(DEFAULT_SQLITE_BUSY_TIMEOUT_MS),
     maxRequestBodyBytes: process.env.COORDINATOR_MAX_BODY_BYTES ?? "65536",
+    serverTimeouts: serverTimeoutsFromEnv(),
     // Pass through as-is so the enum schema's default("false") fires
     // when the env var is unset; previously this branch substituted
     // "false" and z.coerce.boolean() turned it into true.
