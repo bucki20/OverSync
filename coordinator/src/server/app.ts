@@ -10,6 +10,7 @@ import { secretsRoutes } from "./routes/secrets.js";
 import { quotesRoutes } from "./routes/quotes.js";
 import { createCorsMiddleware, createStrictCorsMiddleware } from "./cors.js";
 import { createReadinessRateLimiter } from "./readiness-rate-limit.js";
+import { createRequestIdMiddleware } from "./request-id.js";
 import type { OrderService } from "../services/order-service.js";
 import type { SecretService } from "../services/secret-service.js";
 import type { QuoteService } from "../services/quote-service.js";
@@ -29,6 +30,9 @@ export interface AppDeps {
 export function createApp(deps: AppDeps): Express {
   const { maxRequestBodyBytes } = deps;
   const app = express();
+  // Stable, sanitised request ID echoed on every response for tracing. It must
+  // run before HTTP logging so pino-http records the canonical ID.
+  app.use(createRequestIdMiddleware({ log: deps.log }));
   app.use(pinoHttp({ logger: deps.log }));
   app.use(express.json({ limit: maxRequestBodyBytes }));
   app.use(createCorsMiddleware(deps.corsOrigins));
